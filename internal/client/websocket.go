@@ -12,10 +12,11 @@ import (
 )
 
 type Client struct {
-	conn   *websocket.Conn
-	apiKey string
-	wsURL  string
-	model  string
+	conn          *websocket.Conn
+	apiKey        string
+	wsURL         string
+	model         string
+	streamingDone chan bool // NEW: for signaling goroutines
 }
 
 func New(apiKey, wsURL, model string) *Client {
@@ -63,14 +64,20 @@ func (c *Client) Connect() error {
 }
 
 func (c *Client) Close() error {
-	if c.conn != nil { // בדיקה אם יש חיבור פעיל
+	// Send signal to stop all streaming goroutines
+	if c.streamingDone != nil {
+		close(c.streamingDone)
+	}
+
+	// Close WebSocket connection
+	if c.conn != nil {
 		return c.conn.Close()
 	}
 	return nil
 }
 
 func (c *Client) SendMessage(text string) error {
-    fmt.Printf("📤 Sending: %s\n", text)
+	fmt.Printf("📤 Sending: %s\n", text)
 
 	// יצירת הודעה בפורמט שOpenAI מצפה לו
 	// זה JSON object שמגדיר conversation item חדש
@@ -90,8 +97,24 @@ func (c *Client) SendMessage(text string) error {
 		},
 	}
 
-	// WriteJSON ממיר את ה-map ל-JSON ושולח
-	return c.conn.WriteJSON(message)
+	err := c.conn.WriteJSON(message)
+	if err != nil {
+		// reconnect ו-retry
+		fmt.Println("⚠️ Connection issue detected, refreshing session")
+		fmt.Println("💭 Chat history will not be preserved")
+		fmt.Println("🔄 Reconnecting...")
+
+		if reconnErr := c.Connect(); reconnErr != nil {
+			return fmt.Errorf("reconnect failed: %w", reconnErr)
+		}
+
+		fmt.Println("✅ Reconnected successfully")
+
+		// WriteJSON ממיר את ה-map ל-JSON ושולח
+		return c.conn.WriteJSON(message)
+	}
+
+	return nil
 }
 
 // RequestResponse - מבקש מOpenAI להתחיל לענות
@@ -148,4 +171,96 @@ func (c *Client) ReadResponse() {
 			}
 		}
 	}
+}
+
+// =====================================
+// Concurrent Streaming Implementation
+// =====================================
+
+// StartStreaming reads WebSocket messages concurrently and sends chunks to channel
+// chunks: send-only channel for streaming text chunks
+// done: receive-only channel to signal when to stop
+func (c *Client) StartStreaming(chunks chan<- string, done <-chan bool) {
+	// Note: Channel closing is now handled by the calling goroutine
+
+	for {
+		select {
+		case <-done:
+			return // Stop reading if shutdown signal received
+		default:
+			var response map[string]any
+			err := c.conn.ReadJSON(&response)
+			if err != nil {
+				// Try to send error, but don't panic if channel is closed
+				select {
+				case chunks <- fmt.Sprintf("\n❌ Connection error: %v\n", err):
+				case <-done:
+				}
+				return
+			}
+
+			// Process different message types from OpenAI
+			if msgType, ok := response["type"].(string); ok {
+				switch msgType {
+				case "response.audio_transcript.delta":
+					if delta, ok := response["delta"].(string); ok {
+						// Safe send to chunks channel
+						select {
+						case chunks <- delta:
+						case <-done:
+							return
+						}
+					}
+				case "response.done":
+					// Safe send completion marker
+					select {
+					case chunks <- "\n":
+					case <-done:
+					}
+					return
+				case "error":
+					// Safe send error message
+					select {
+					case chunks <- fmt.Sprintf("\n❌ AI Error: %+v\n", response):
+					case <-done:
+					}
+					return
+				}
+			}
+		}
+	}
+}
+
+// SendMessageAsync sends message and requests response without waiting
+// Used for concurrent mode where StartStreaming() handles the response
+// text: user message to send to OpenAI
+func (c *Client) SendMessageAsync(text string) error {
+	// Build user message for OpenAI Realtime API
+	message := map[string]any{
+		"type": "conversation.item.create",
+		"item": map[string]any{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]any{
+				{"type": "input_text", "text": text},
+			},
+		},
+	}
+
+	// Send user message to WebSocket
+	if err := c.conn.WriteJSON(message); err != nil {
+		return fmt.Errorf("failed to send message: %w", err)
+	}
+
+	// Request AI response immediately
+	responseRequest := map[string]any{
+		"type": "response.create",
+	}
+
+	if err := c.conn.WriteJSON(responseRequest); err != nil {
+		return fmt.Errorf("failed to request response: %w", err)
+	}
+
+	return nil
+	// Note: No waiting for response - StartStreaming() goroutine handles it
 }
