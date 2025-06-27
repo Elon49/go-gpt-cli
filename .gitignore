@@ -11,6 +11,12 @@
 *.so
 *.dylib
 
+# Go binary executables (no extension)
+gpt-cli
+cli/gpt-cli
+**/bin/
+dist/
+
 # Test binary, built with `go test -c`
 *.test
 
